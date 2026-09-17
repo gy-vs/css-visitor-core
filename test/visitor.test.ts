@@ -1625,4 +1625,216 @@ test('does not overflow the stack on deeply nested nodes', () => {
   is(result, 'a{'.repeat(depth) + 'color:red' + '}'.repeat(depth))
 })
 
+function buildOrderVisitor(
+  order: string[][],
+  mutate: (rule: Rule) => void
+): Plugin[] {
+  return [
+    {
+      postcssPlugin: 'recorder',
+      RootExit() {
+        order.push(['RootExit'])
+      },
+      Rule(rule) {
+        order.push(['Rule', rule.selector])
+      },
+      RuleExit(rule) {
+        order.push(['RuleExit', rule.selector])
+      }
+    },
+    {
+      postcssPlugin: 'mutator',
+      Rule: mutate
+    }
+  ]
+}
+
+for (let funcType of ['sync', 'async']) {
+  test(`visits ${funcType} nodes inserted after the current one in the same pass`, async () => {
+    let order: string[][] = []
+    let result = postcss(
+      buildOrderVisitor(order, rule => {
+        if (rule.selector === 'a') {
+          rule.after(postcss.rule({ selector: 'x' }))
+        }
+      })
+    ).process('a{} b{}', { from: undefined })
+    if (funcType === 'sync') {
+      result.sync()
+    } else {
+      await result.async()
+    }
+
+    equal(
+      addIndex(order),
+      addIndex([
+        ['Rule', 'a'],
+        ['RuleExit', 'a'],
+        // The inserted sibling is visited before the next sibling
+        // and before the container exit event
+        ['Rule', 'x'],
+        ['RuleExit', 'x'],
+        ['Rule', 'b'],
+        ['RuleExit', 'b'],
+        ['RootExit'],
+        // The mutation marks the tree dirty, so a second pass runs
+        ['RootExit']
+      ])
+    )
+  })
+
+  test(`does not re-visit ${funcType} nodes inserted before the current one`, async () => {
+    let order: string[][] = []
+    let result = postcss(
+      buildOrderVisitor(order, rule => {
+        if (rule.selector === 'b') {
+          rule.before(postcss.rule({ selector: 'x' }))
+        }
+      })
+    ).process('a{} b{}', { from: undefined })
+    if (funcType === 'sync') {
+      result.sync()
+    } else {
+      await result.async()
+    }
+
+    equal(
+      addIndex(order),
+      addIndex([
+        ['Rule', 'a'],
+        ['RuleExit', 'a'],
+        ['Rule', 'b'],
+        ['RuleExit', 'b'],
+        ['RootExit'],
+        // Inserted behind the iterator: visited on the second pass,
+        // already visited nodes are not re-visited
+        ['Rule', 'x'],
+        ['RuleExit', 'x'],
+        ['RootExit']
+      ])
+    )
+  })
+
+  test(`does not skip ${funcType} siblings after removing the current node`, async () => {
+    let order: string[][] = []
+    let result = postcss(
+      buildOrderVisitor(order, rule => {
+        if (rule.selector === 'b') rule.remove()
+      })
+    ).process('a{} b{} c{}', { from: undefined })
+    if (funcType === 'sync') {
+      result.sync()
+    } else {
+      await result.async()
+    }
+
+    equal(
+      addIndex(order),
+      addIndex([
+        ['Rule', 'a'],
+        ['RuleExit', 'a'],
+        ['Rule', 'b'],
+        // The removed node has no exit event, the next sibling
+        // is still visited
+        ['Rule', 'c'],
+        ['RuleExit', 'c'],
+        ['RootExit'],
+        ['RootExit']
+      ])
+    )
+  })
+
+  test(`skips ${funcType} siblings removed during the current visit`, async () => {
+    let order: string[][] = []
+    let result = postcss(
+      buildOrderVisitor(order, rule => {
+        if (rule.selector === 'a') rule.next()!.remove()
+      })
+    ).process('a{} b{} c{}', { from: undefined })
+    if (funcType === 'sync') {
+      result.sync()
+    } else {
+      await result.async()
+    }
+
+    equal(
+      addIndex(order),
+      addIndex([
+        ['Rule', 'a'],
+        ['RuleExit', 'a'],
+        // b was removed before its turn and is never visited
+        ['Rule', 'c'],
+        ['RuleExit', 'c'],
+        ['RootExit'],
+        ['RootExit']
+      ])
+    )
+  })
+
+  test(`visits ${funcType} rules lifted out of the current node before RootExit`, async () => {
+    let order: string[][] = []
+    let result = postcss(
+      buildOrderVisitor(order, rule => {
+        for (let child of rule.nodes.slice()) {
+          if (child.type === 'rule') {
+            child.selector = rule.selector + ' ' + child.selector
+            rule.after(child)
+          }
+        }
+      })
+    ).process('a { b { c {} } }', { from: undefined })
+    if (funcType === 'sync') {
+      result.sync()
+    } else {
+      await result.async()
+    }
+
+    equal(
+      addIndex(order),
+      addIndex([
+        ['Rule', 'a'],
+        ['RuleExit', 'a'],
+        // Rules lifted behind the current node are visited in the
+        // same pass, before the root exit event
+        ['Rule', 'a b'],
+        ['RuleExit', 'a b'],
+        ['Rule', 'a b c'],
+        ['RuleExit', 'a b c'],
+        ['RootExit'],
+        // Containers dirtied by the moves are revisited on the second pass
+        ['Rule', 'a'],
+        ['RuleExit', 'a'],
+        ['Rule', 'a b'],
+        ['RuleExit', 'a b'],
+        ['RootExit']
+      ])
+    )
+  })
+}
+
+test('visits nodes in the same order on sync and async walks', async () => {
+  let orders: string[][][] = []
+  for (let funcType of ['sync', 'async']) {
+    let order: string[][] = []
+    let result = postcss(
+      buildOrderVisitor(order, rule => {
+        for (let child of rule.nodes.slice()) {
+          if (child.type === 'rule') {
+            child.selector = rule.selector + ' ' + child.selector
+            rule.after(child)
+          }
+        }
+      })
+    ).process('a { b { c {} } } d{}', { from: undefined })
+    if (funcType === 'sync') {
+      result.sync()
+    } else {
+      await result.async()
+    }
+    orders.push(order)
+  }
+
+  equal(orders[0], orders[1])
+})
+
 test.run()
