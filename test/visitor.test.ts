@@ -1406,6 +1406,118 @@ for (let funcType of ['sync', 'async']) {
     is(DocumentExit, 2)
     is(OnceExit, 2) // 2 roots === 2 OnceExit
   })
+
+  test(`visits ${funcType} siblings inserted after the current node`, async () => {
+    let order: string[] = []
+    let hoister: Plugin = {
+      postcssPlugin: 'hoister',
+      RootExit() {
+        order.push('RootExit')
+      },
+      Rule(rule) {
+        order.push(rule.selector)
+        for (let child of rule.nodes) {
+          if (child.type === 'rule') {
+            child.selector = `${rule.selector} ${child.selector}`
+            rule.after(child)
+          }
+        }
+      }
+    }
+
+    let result = postcss([hoister]).process('a { b { c {} } }', {
+      from: 'a.css'
+    })
+    if (funcType === 'sync') {
+      result.css
+    } else {
+      await result
+    }
+
+    equal(order, [
+      'a',
+      'a b',
+      'a b c',
+      'RootExit',
+      // Moving children out dirtied `a` and `a b`,
+      // so the second pass re-visits them
+      'a',
+      'a b',
+      'RootExit'
+    ])
+  })
+
+  test(`does not visit ${funcType} nodes inserted before the current one`, async () => {
+    let order: string[] = []
+    let inserter: Plugin = {
+      postcssPlugin: 'inserter',
+      RootExit() {
+        order.push('RootExit')
+      },
+      Rule(rule) {
+        order.push(rule.selector)
+        if (rule.selector === 'b') {
+          rule.before(postcss.rule({ selector: 'a2' }))
+        }
+      }
+    }
+
+    let result = postcss([inserter]).process('a {} b {} c {}', {
+      from: 'a.css'
+    })
+    if (funcType === 'sync') {
+      result.css
+    } else {
+      await result
+    }
+
+    // `a2` is inserted behind the cursor,
+    // so it is visited only on the next pass
+    equal(order, ['a', 'b', 'c', 'RootExit', 'a2', 'RootExit'])
+  })
+
+  test(`handles ${funcType} removing nodes during the visit`, async () => {
+    let order: string[] = []
+    let remover: Plugin = {
+      postcssPlugin: 'remover',
+      RootExit() {
+        order.push('RootExit')
+      },
+      Rule(rule) {
+        order.push(rule.selector)
+        if (rule.selector === 'a') {
+          let next = rule.next()
+          if (next) next.remove()
+        } else if (rule.selector === 'c') {
+          rule.remove()
+        }
+      },
+      RuleExit(rule) {
+        order.push(`${rule.selector} exit`)
+      }
+    }
+
+    let result = postcss([remover]).process('a {} b {} c {} d {}', {
+      from: 'a.css'
+    })
+    if (funcType === 'sync') {
+      result.css
+    } else {
+      await result
+    }
+
+    equal(order, [
+      'a',
+      'a exit',
+      // `b` was removed before its turn and is never visited
+      'c',
+      // `c` removed itself, so its exit event is skipped
+      'd',
+      'd exit',
+      'RootExit',
+      'RootExit'
+    ])
+  })
 }
 
 test('throws error from async OnceExit', async () => {
